@@ -78,7 +78,6 @@ impl PackageQuery {
             exclude: false,
             selector: PackageSelector::ContainingPackage(path),
             traversal: None,
-            diff: None,
             source: None,
         })))
     }
@@ -122,9 +121,6 @@ pub enum PackageQueryResolveError {
         package_paths.iter().map(|p| p.as_path().display().to_string()).collect::<Vec<_>>().join(", ")
     )]
     AmbiguousPackageName { package_name: Str, package_paths: Box<[Arc<AbsolutePath>]> },
-
-    #[error("Filtering by changed packages failed for ref '{base_ref}': {message}")]
-    GitDiffFailed { base_ref: Str, message: Str },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -268,7 +264,7 @@ impl IndexedPackageGraph {
 
         // Apply inclusions: union each filter's resolved set into `selected`.
         for filter in &inclusions {
-            let matched = self.resolve_filter_entries(filter)?;
+            let matched = self.resolve_selector_entries(&filter.selector)?;
             let expanded = self.expand_traversal(matched, filter.traversal.as_ref());
             // Track filters that contribute nothing (typo, no-match glob, or a
             // traversal like `^...` that collapsed an otherwise-matching seed
@@ -284,7 +280,7 @@ impl IndexedPackageGraph {
 
         // Apply exclusions: subtract each filter's resolved set from `selected`.
         for filter in &exclusions {
-            let matched = self.resolve_filter_entries(filter)?;
+            let matched = self.resolve_selector_entries(&filter.selector)?;
             let to_remove = self.expand_traversal(matched, filter.traversal.as_ref());
             for pkg in to_remove {
                 selected.remove(&pkg);
@@ -293,50 +289,6 @@ impl IndexedPackageGraph {
 
         let package_subgraph = self.build_induced_subgraph(&selected);
         Ok(FilterResolution { package_subgraph, unmatched_selectors })
-    }
-
-    /// Resolve a full `PackageFilter` into the directly matched package set.
-    ///
-    /// Applies the core selector, then optionally intersects with packages that have
-    /// changes since the diff ref (`filter.diff`).
-    fn resolve_filter_entries(
-        &self,
-        filter: &PackageFilter,
-    ) -> Result<FxHashSet<PackageNodeIndex>, PackageQueryResolveError> {
-        let mut matched = self.resolve_selector_entries(&filter.selector)?;
-
-        let Some(base_ref) = filter.diff.as_ref() else {
-            return Ok(matched);
-        };
-
-        let workspace_root = self.get_workspace_root_path();
-        let changed_files = crate::git_changed::changed_files_since_ref(
-            workspace_root.as_ref(),
-            base_ref.as_str(),
-        )?;
-
-        let mut changed = FxHashSet::default();
-        for changed_file in changed_files {
-            if let Some(idx) = self.get_package_index_from_cwd(changed_file.as_ref()) {
-                changed.insert(idx);
-            }
-        }
-
-        matched.retain(|idx| changed.contains(idx));
-        Ok(matched)
-    }
-
-    fn get_workspace_root_path(&self) -> Arc<AbsolutePath> {
-        for idx in self.graph.node_indices() {
-            if self.graph[idx].path.as_str().is_empty() {
-                return Arc::clone(&self.graph[idx].absolute_path);
-            }
-        }
-        // `load_package_graph` ensures the root package exists, but fall back just in case.
-        Arc::clone(
-            &self.graph[self.graph.node_indices().next().expect("package graph is non-empty")]
-                .absolute_path,
-        )
     }
 
     /// Resolve a `PackageSelector` to the set of directly matched packages
@@ -380,10 +332,6 @@ impl IndexedPackageGraph {
                         break;
                     }
                 }
-            }
-
-            PackageSelector::All => {
-                matched.extend(self.graph.node_indices());
             }
         }
 
@@ -578,142 +526,5 @@ impl IndexedPackageGraph {
             }
         }
         subgraph
-    }
-}
-
-#[cfg(test)]
-mod diff_selector_tests {
-    use std::{fs, process::Command};
-
-    use vec1::Vec1;
-    use vite_path::AbsolutePathBuf;
-
-    use super::*;
-    use crate::{find_workspace_root, load_package_graph, package_filter::parse_filter};
-
-    fn git(cwd: &AbsolutePath, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(cwd.as_path())
-            .args(args)
-            .output()
-            .expect("failed to run git");
-        assert!(
-            output.status.success(),
-            "git command failed: git -C {} {}\nstdout: {}\nstderr: {}",
-            cwd.as_path().display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn write(path: &AbsolutePathBuf, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent.as_path()).expect("failed to create parent dir");
-        }
-        fs::write(path.as_path(), content).expect("failed to write file");
-    }
-
-    fn rev_parse_head(cwd: &AbsolutePath) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(cwd.as_path())
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("git rev-parse");
-        assert!(output.status.success(), "git rev-parse failed");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    #[test]
-    fn diff_selector_selects_changed_packages() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let ws_path = AbsolutePathBuf::new(temp_dir.path().to_path_buf()).unwrap();
-
-        git(ws_path.as_ref(), &["init"]);
-        git(ws_path.as_ref(), &["config", "user.email", "test@example.com"]);
-        git(ws_path.as_ref(), &["config", "user.name", "Test"]);
-
-        write(&ws_path.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
-        write(&ws_path.join("package.json"), "{\n  \"name\": \"root\"\n}\n");
-
-        // a -> b (dependency edge used by second test)
-        write(
-            &ws_path.join("packages/a/package.json"),
-            "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"b\": \"workspace:*\"\n  }\n}\n",
-        );
-        write(&ws_path.join("packages/b/package.json"), "{\n  \"name\": \"b\"\n}\n");
-        write(&ws_path.join("packages/a/src/index.ts"), "export const a = 1;\n");
-
-        git(ws_path.as_ref(), &["add", "."]);
-        git(ws_path.as_ref(), &["commit", "-m", "initial"]);
-        let base_ref = rev_parse_head(ws_path.as_ref());
-
-        // Modify a
-        write(&ws_path.join("packages/a/src/index.ts"), "export const a = 2;\n");
-
-        let (workspace_root, _) = find_workspace_root(ws_path.as_ref()).expect("workspace root");
-        let graph = load_package_graph(&workspace_root).expect("load graph");
-        let indexed = IndexedPackageGraph::index(graph);
-
-        let filter = parse_filter(&format!("[{base_ref}]"), workspace_root.path.as_ref()).unwrap();
-        let query = PackageQuery::filters(Vec1::new(filter));
-        let res = indexed.resolve_query(&query).expect("resolve query");
-
-        let selected_paths: Vec<_> = res
-            .package_subgraph
-            .nodes()
-            .map(|idx| indexed.package_graph()[idx].path.as_str().to_string())
-            .collect();
-
-        assert!(selected_paths.contains(&"packages/a".to_string()));
-        assert!(!selected_paths.contains(&"packages/b".to_string()));
-    }
-
-    #[test]
-    fn diff_selector_with_dependencies_traversal_expands() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let ws_path = AbsolutePathBuf::new(temp_dir.path().to_path_buf()).unwrap();
-
-        git(ws_path.as_ref(), &["init"]);
-        git(ws_path.as_ref(), &["config", "user.email", "test@example.com"]);
-        git(ws_path.as_ref(), &["config", "user.name", "Test"]);
-
-        write(&ws_path.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n");
-        write(&ws_path.join("package.json"), "{\n  \"name\": \"root\"\n}\n");
-
-        // a -> b
-        write(
-            &ws_path.join("packages/a/package.json"),
-            "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"b\": \"workspace:*\"\n  }\n}\n",
-        );
-        write(&ws_path.join("packages/b/package.json"), "{\n  \"name\": \"b\"\n}\n");
-        write(&ws_path.join("packages/a/src/index.ts"), "export const a = 1;\n");
-
-        git(ws_path.as_ref(), &["add", "."]);
-        git(ws_path.as_ref(), &["commit", "-m", "initial"]);
-        let base_ref = rev_parse_head(ws_path.as_ref());
-
-        // Modify a
-        write(&ws_path.join("packages/a/src/index.ts"), "export const a = 2;\n");
-
-        let (workspace_root, _) = find_workspace_root(ws_path.as_ref()).expect("workspace root");
-        let graph = load_package_graph(&workspace_root).expect("load graph");
-        let indexed = IndexedPackageGraph::index(graph);
-
-        let filter =
-            parse_filter(&format!("[{base_ref}]..."), workspace_root.path.as_ref()).unwrap();
-        let query = PackageQuery::filters(Vec1::new(filter));
-        let res = indexed.resolve_query(&query).expect("resolve query");
-
-        let selected_paths: Vec<_> = res
-            .package_subgraph
-            .nodes()
-            .map(|idx| indexed.package_graph()[idx].path.as_str().to_string())
-            .collect();
-
-        assert!(selected_paths.contains(&"packages/a".to_string()));
-        assert!(selected_paths.contains(&"packages/b".to_string()));
     }
 }

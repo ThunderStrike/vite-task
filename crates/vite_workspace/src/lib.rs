@@ -1,5 +1,4 @@
 mod error;
-mod git_changed;
 pub mod package;
 pub mod package_filter;
 pub mod package_graph;
