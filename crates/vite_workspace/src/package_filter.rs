@@ -140,6 +140,11 @@ pub(crate) enum PackageSelector {
     /// Select the workspace root package (the package with empty relative path).
     /// Produced by `-w` / `--workspace-root`.
     WorkspaceRoot,
+
+    /// Select all packages in the workspace.
+    ///
+    /// Used for diff-only selectors like `[origin/main]`.
+    All,
 }
 
 /// Direction to traverse the package dependency graph from the initially matched packages.
@@ -189,6 +194,11 @@ pub(crate) struct PackageFilter {
     /// `None` = exact match only (no traversal).
     pub(crate) traversal: Option<GraphTraversal>,
 
+    /// Optional diff selector: only include packages with changes since this git ref.
+    ///
+    /// Mirrors pnpm's `diff` selector: `[origin/main]`.
+    pub(crate) diff: Option<Str>,
+
     /// Original `--filter` token that produced this filter.
     /// `None` for synthetic filters (implicit cwd, package name, `-w`).
     pub(crate) source: Option<Str>,
@@ -206,6 +216,12 @@ pub enum PackageFilterParseError {
 
     #[error("Invalid glob pattern: {0}")]
     InvalidGlob(#[from] wax::BuildError),
+
+    #[error("Invalid diff selector")]
+    InvalidDiffSelector,
+
+    #[error("Empty diff selector")]
+    EmptyDiffSelector,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -364,6 +380,7 @@ impl PackageQueryArgs {
                         exclude: false,
                         selector: PackageSelector::WorkspaceRoot,
                         traversal: None,
+                        diff: None,
                         source: None,
                     });
                 }
@@ -384,6 +401,7 @@ impl PackageQueryArgs {
                         exclude: false,
                         selector: PackageSelector::WorkspaceRoot,
                         traversal,
+                        diff: None,
                         source: None,
                     })),
                     false,
@@ -407,6 +425,7 @@ impl PackageQueryArgs {
                             unique: true,
                         }),
                         traversal,
+                        diff: None,
                         source: None,
                     })),
                     false,
@@ -421,6 +440,7 @@ impl PackageQueryArgs {
                         direction: TraversalDirection::Dependencies,
                         exclude_self: false,
                     }),
+                    diff: None,
                     source: None,
                 })),
                 false,
@@ -431,6 +451,7 @@ impl PackageQueryArgs {
                     exclude: false,
                     selector: PackageSelector::ContainingPackage(Arc::clone(cwd)),
                     traversal: None,
+                    diff: None,
                     source: None,
                 })),
                 true,
@@ -499,14 +520,14 @@ pub(crate) fn parse_filter(
     };
 
     // Step 6–9: parse the remaining core selector.
-    let (selector, supports_traversal) = parse_core_selector(core, cwd)?;
+    let (selector, diff, supports_traversal) = parse_core_selector(core, cwd)?;
 
     // pnpm discards traversal on unbraced path selectors — `..` (parent dir)
     // and `...` (traversal) are ambiguous. Braces disambiguate: `{./path}...`.
     // Ref: https://github.com/pnpm/pnpm/issues/1651
     let traversal = if supports_traversal { traversal } else { None };
 
-    Ok(PackageFilter { exclude, selector, traversal, source: Some(Str::from(input)) })
+    Ok(PackageFilter { exclude, selector, traversal, diff, source: Some(Str::from(input)) })
 }
 
 /// Parse the core selector string (after stripping `!` and `...` markers).
@@ -527,7 +548,23 @@ pub(crate) fn parse_filter(
 fn parse_core_selector(
     core: &str,
     cwd: &AbsolutePath,
-) -> Result<(PackageSelector, bool), PackageFilterParseError> {
+) -> Result<(PackageSelector, Option<Str>, bool), PackageFilterParseError> {
+    // Optional diff selector suffix: `[ref]`.
+    // Mirrors pnpm's `diff` group in `SELECTOR_REGEX`.
+    let (core, diff) = if let Some(without_close) = core.strip_suffix(']') {
+        let Some(open_pos) = without_close.rfind('[') else {
+            return Err(PackageFilterParseError::InvalidDiffSelector);
+        };
+        let diff_inner = &without_close[open_pos + 1..];
+        if diff_inner.is_empty() {
+            return Err(PackageFilterParseError::EmptyDiffSelector);
+        }
+        let before = &without_close[..open_pos];
+        (before, Some(Str::from(diff_inner)))
+    } else {
+        (core, None)
+    };
+
     // Try to extract a brace-enclosed directory suffix: `{...}`.
     // The name part before the brace must not start with `.` (pnpm regex Group 1 constraint).
     if let Some(without_closing) = core.strip_suffix('}')
@@ -543,11 +580,11 @@ fn parse_core_selector(
 
             return if name_part.is_empty() {
                 // Only a directory selector: `{./foo}` or `{packages/app}`.
-                Ok((PackageSelector::Directory(directory), true))
+                Ok((PackageSelector::Directory(directory), diff, true))
             } else {
                 // Name and directory combined: `foo{./bar}`.
                 let name = build_name_pattern(name_part)?;
-                Ok((PackageSelector::NameAndDirectory { name, directory }, true))
+                Ok((PackageSelector::NameAndDirectory { name, directory }, diff, true))
             };
         }
         // name_part starts with `.`: fall through — treat entire core as a relative path.
@@ -558,16 +595,20 @@ fn parse_core_selector(
     // Traversal is NOT supported — pnpm discards `...` on unbraced path selectors.
     if core.starts_with('.') {
         let directory = resolve_directory_pattern(core, cwd)?;
-        return Ok((PackageSelector::Directory(directory), false));
+        return Ok((PackageSelector::Directory(directory), diff, false));
     }
 
-    // Guard against an empty selector reaching here.
+    // Diff-only selector: `[ref]`.
     if core.is_empty() {
-        return Err(PackageFilterParseError::EmptySelector);
+        return if diff.is_some() {
+            Ok((PackageSelector::All, diff, true))
+        } else {
+            Err(PackageFilterParseError::EmptySelector)
+        };
     }
 
     // Plain name or glob pattern.
-    Ok((PackageSelector::Name(build_name_pattern(core)?), true))
+    Ok((PackageSelector::Name(build_name_pattern(core)?), diff, true))
 }
 
 /// Resolve a directory selector string into a [`DirectoryPattern`].
@@ -746,6 +787,16 @@ mod tests {
         }
     }
 
+    fn assert_diff(filter: &PackageFilter, expected: Option<&str>) {
+        match (filter.diff.as_ref().map(|s| s.as_str()), expected) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual, expected, "diff mismatch");
+            }
+            (actual, expected) => panic!("expected diff {expected:?}, got {actual:?}"),
+        }
+    }
+
     // ── Tests ported from pnpm parsePackageSelector.ts ──────────────────────
 
     #[test]
@@ -755,6 +806,34 @@ mod tests {
         assert!(!f.exclude);
         assert_exact_name(&f, "foo");
         assert_no_traversal(&f);
+        assert_diff(&f, None);
+    }
+
+    #[test]
+    fn diff_only_selector() {
+        let cwd = abs("/workspace");
+        let f = parse_filter("[origin/main]", cwd).unwrap();
+        assert!(!f.exclude);
+        assert!(matches!(f.selector, PackageSelector::All));
+        assert_no_traversal(&f);
+        assert_diff(&f, Some("origin/main"));
+    }
+
+    #[test]
+    fn name_and_diff_selector() {
+        let cwd = abs("/workspace");
+        let f = parse_filter("foo[origin/main]", cwd).unwrap();
+        assert!(!f.exclude);
+        assert_exact_name(&f, "foo");
+        assert_no_traversal(&f);
+        assert_diff(&f, Some("origin/main"));
+    }
+
+    #[test]
+    fn empty_diff_is_error() {
+        let cwd = abs("/workspace");
+        let err = parse_filter("[]", cwd).unwrap_err();
+        assert!(matches!(err, PackageFilterParseError::EmptyDiffSelector));
     }
 
     #[test]
